@@ -3,6 +3,7 @@ import re
 import io
 import asyncio
 import difflib
+import urllib.request
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
@@ -19,8 +20,33 @@ pokemon_normalized_names = []
 alnum_regex = re.compile(r"[^a-zA-Z0-9\-\']")
 normalization_regex = re.compile(r"[^a-z0-9]")
 
+def sanitize_text(text: str) -> str:
+    """
+    Cleans incoming text by throwing away weird whitespaces and non-whitelisted characters.
+    Only allows: letters, numbers, spaces, single quotes, and hyphens.
+    """
+    if not text:
+        return ""
+    # Convert all odd whitespaces, tabs, or newlines into standard spaces
+    text = re.sub(r"\s+", " ", text)
+    # Strip everything except A-Z, a-z, 0-9, hyphen, single quote, and normal spaces
+    text = re.sub(r"[^a-zA-Z0-9\-\' ]", "", text)
+    # Collapse multiple spaces down to a single space and strip borders
+    return re.sub(r" +", " ", text).strip()
+
 def normalize_name(text: str) -> str:
     return normalization_regex.sub("", text.lower())
+
+def download_image_from_url(url: str) -> bytes:
+    """
+    Synchronously fetches raw image data from a URL with a fallback User-Agent header.
+    """
+    req = urllib.request.Request(
+        url, 
+        headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return response.read()
 
 @app.on_event("startup")
 def load_pokemon_database():
@@ -29,7 +55,7 @@ def load_pokemon_database():
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
-                name = line.strip()
+                name = sanitize_text(line)
                 if name:
                     normalized = normalize_name(name)
                     pokemon_dict[normalized] = name
@@ -90,7 +116,9 @@ def process_image_ocr(image_bytes: bytes) -> Optional[str]:
             config_pass_2 = f"{whitelist} --psm 11"
             raw_ocr_text = pytesseract.image_to_string(image, config=config_pass_2)
             
-        words = raw_ocr_text.split()
+        # Sanitize raw OCR characters before processing chunks
+        sanitized_ocr = sanitize_text(raw_ocr_text)
+        words = sanitized_ocr.split()
         
         cleaned_parts = []
         for word in words:
@@ -110,33 +138,49 @@ def process_image_ocr(image_bytes: bytes) -> Optional[str]:
 @app.post("/predict")
 async def predict_pokemon(
     text: Optional[str] = Form(None), 
-    image: Optional[UploadFile] = File(None)
+    image: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None)
 ):
-    # 1. Pipeline Priority 1: Text-based validation and matching
-    if text:
-        content = text.strip()
+    # Determine if standard 'text' argument is carrying an explicit URL string instead
+    text_has_link = False
+    if text and ("http://" in text or "https://" in text):
+        text_has_link = True
+        if not image_url:
+            image_url = text.strip()
+
+    # 1. Pipeline Priority 1: Text-based explicit match (Skip if flagged as a URL)
+    if text and not text_has_link:
+        content = sanitize_text(text)
         text_valid = True
         
         if len(content) > 72:
             text_valid = False
-        elif content.count('\n') > 2:
-            text_valid = False
-        elif "http://" in content or "https://" in content:
-            text_valid = False
 
-        if text_valid:
+        if text_valid and content:
             best_match = get_best_match(content)
             if best_match:
                 return {"pokemon": best_match, "source": "text"}
 
-    # 2. Pipeline Priority 2: OCR-based matching if text fallback missed or was skipped
+    # 2. Pipeline Priority 2: OCR Extraction via File Upload or Downloadable Link
+    image_bytes = None
+
     if image:
         image_bytes = await image.read()
+    elif image_url:
+        try:
+            # Safely hand down blocking download logic into low-level thread worker pools
+            image_bytes = await asyncio.to_thread(download_image_from_url, image_url)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch image link resource: {str(e)}")
+
+    if image_bytes:
         extracted_word = await asyncio.to_thread(process_image_ocr, image_bytes)
         
         if extracted_word:
-            best_match = get_best_match(extracted_word)
-            if best_match:
-                return {"pokemon": best_match, "source": "ocr"}
+            extracted_word = sanitize_text(extracted_word)
+            if extracted_word:
+                best_match = get_best_match(extracted_word)
+                if best_match:
+                    return {"pokemon": best_match, "source": "ocr"}
 
     raise HTTPException(status_code=404, detail="Pokémon could not be identified.")
